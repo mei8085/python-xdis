@@ -32,6 +32,20 @@ from xdis.bytecode import (
     offset2line,
     op_has_argument,
 )
+from xdis.bytecode_entry import (
+    EntryDecodeError,
+    EntryDecodeResult,
+    EntryInstruction,
+    EntryKind,
+    LinearScan,
+    classify_entry,
+    decode_entries,
+    decode_entry,
+    encoding_rules,
+    find_entry_offsets,
+    linear_scan,
+    version_encoding_table,
+)
 from xdis.codetype import (
     Code2,
     Code3,
@@ -194,6 +208,12 @@ __all__ = [
     "Code310",
     "Code311",
     "Code311Graal",
+    # bytecode_entry
+    "EntryDecodeError",
+    "EntryDecodeResult",
+    "EntryInstruction",
+    "EntryKind",
+    "LinearScan",
     # instruction
     "Instruction",
     # lineoffsets
@@ -205,6 +225,7 @@ __all__ = [
     "canonic_python_version",
     # load
     "check_object_path",
+    "classify_entry",
     "co_flags_is_async",
     "code2num",
     "codeType2Portable",
@@ -212,10 +233,14 @@ __all__ = [
     "code_has_star_star_arg",
     # cross_dis
     "code_info",
+    "decode_entries",
+    "decode_entry",
     "disassemble_file",
     "disco_loop",
     "disco_loop_asm_format",
+    "encoding_rules",
     "extended_arg_val",
+    "find_entry_offsets",
     "findlabels",
     "findlinestarts",
     "format_code_info",
@@ -234,6 +259,7 @@ __all__ = [
     "iscode",
     "lineoffsets_in_file",
     "lineoffsets_in_module",
+    "linear_scan",
     "list2bytecode",
     "load_file",
     "load_module",
@@ -269,5 +295,6 @@ __all__ = [
     "show_code",
     "show_module_header",
     "sysinfo2magic",
+    "version_encoding_table",
     "write_bytecode_file",
 ]

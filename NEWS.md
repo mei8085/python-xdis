@@ -1,3 +1,22 @@
+6.3.2 (in progress)
+===================
+
+* Add `xdis.bytecode_entry`: multi-entry bytecode decoding for
+  anti-analysis / obfuscated code. Entry offsets (offset 0, jump targets,
+  exception-table targets, or user-supplied) are classified as legal
+  instruction starts, byte-aligned positions inside an `EXTENDED_ARG`
+  chain, misaligned (mid-instruction) positions, or out-of-bounds
+  offsets, and each entry is decoded with the fresh `EXTENDED_ARG`
+  accumulation state the interpreter would use when a jump lands there.
+  Instructions decoded from bytes that the canonical linear sweep regards
+  as operand data are flagged (`EntryInstruction.mid_instruction`) rather
+  than silently surfaced as safe instructions, and re-synchronization
+  with canonical boundaries is reported. `encoding_rules()` /
+  `version_encoding_table()` expose the per-version instruction widths
+  (1/3 bytes before 3.6, fixed 2-byte wordcode after), `EXTENDED_ARG`
+  shift (16 vs 8 bits), jump-operand units (bytes vs words from 3.10),
+  CACHE slots (3.11+), and whether a misaligned stream can resynchronize.
+
 6.3.1 2026-09-11
 ================
 
