@@ -39,6 +39,7 @@ from xdis.cross_types import (
     UnicodeForPython3,
 )
 from xdis.magics import GRAAL3_MAGICS, PYPY3_MAGICS, RUSTPYTHON_MAGICS, magic_int2tuple
+from xdis.tuplebuild import TupleBuilder
 
 
 def long(n: int) -> LongTypeForPython3:
@@ -249,10 +250,14 @@ class VersionIndependentUnmarshaller:
         return obj, i
 
     def r_ref_insert(self, obj, i: int | None):
-        if i is not None and not isinstance(obj, (set, list)):
-            # I am not sure if this is right...
-            # We can't turn into a set a list that contains a
-            # list or a set. So skip these, for now
+        # Fill the reference slot that was reserved *before* the object's
+        # contents were read.  Any object type can replace its placeholder:
+        # the slot is just a position in the reference table, so a set,
+        # frozenset, frozendict or code object can be installed exactly
+        # where later TYPE_REF tags expect to find it.  Skipping this for
+        # some types would leave the placeholder in the table and silently
+        # redirect every back reference at the wrong object.
+        if i is not None:
             self.intern_objects[i] = obj
         return obj
 
@@ -464,19 +469,30 @@ class VersionIndependentUnmarshaller:
     def t_small_tuple(self, save_ref, bytes_for_s: bool = False):
         # small tuple - since Python 3.4
         tuplesize = unpack("B", self.fp.read(1))[0]
-        ret, i = self.r_ref_reserve((), save_ref)
+        # Reserve the reference slot *before* reading the elements: a child
+        # object may carry a TYPE_REF back to this tuple (self-reference or
+        # a mutual cycle), so the object stored in the slot must already be
+        # the tuple that will be returned. TupleBuilder keeps that identity
+        # stable while the slots are being filled.
+        builder = TupleBuilder(tuplesize)
+        _, i = self.r_ref_reserve(builder.placeholder, save_ref)
         while tuplesize > 0:
-            ret += (self.r_object(bytes_for_s=bytes_for_s),)
+            builder.append(self.r_object(bytes_for_s=bytes_for_s))
             tuplesize -= 1
-        return self.r_ref_insert(ret, i)
+        return self.r_ref_insert(builder.finish(), i)
 
     def t_tuple(self, save_ref, bytes_for_s: bool = False):
         tuplesize = self.read_uint32()
-        ret = self.r_ref((), save_ref)
+        # Same two-phase reservation as t_small_tuple: back references from
+        # inside the tuple must resolve to the tuple itself, not to the
+        # empty seed object that tuple concatenation would otherwise leave
+        # behind in the reference table.
+        builder = TupleBuilder(tuplesize)
+        _, i = self.r_ref_reserve(builder.placeholder, save_ref)
         while tuplesize > 0:
-            ret += (self.r_object(bytes_for_s=bytes_for_s),)
+            builder.append(self.r_object(bytes_for_s=bytes_for_s))
             tuplesize -= 1
-        return ret
+        return self.r_ref_insert(builder.finish(), i)
 
     def t_list(self, save_ref, bytes_for_s: bool = False):
         # FIXME: check me
@@ -500,9 +516,14 @@ class VersionIndependentUnmarshaller:
 
     def t_set(self, save_ref, bytes_for_s: bool = False) -> set:
         setsize = self.read_uint32()
-        ret, i = self.r_ref_reserve((), save_ref)
+        # Build into a list while reserving the set's reference slot up
+        # front. A set cannot contain itself until it exists, so a stream
+        # that references the set while reading its elements resolves to
+        # this placeholder; once construction finishes the slot is replaced
+        # by the real set (r_ref_insert no longer skips set objects).
+        ret, i = self.r_ref_reserve([], save_ref)
         while setsize > 0:
-            ret += (self.r_object(bytes_for_s=bytes_for_s),)
+            ret.append(self.r_object(bytes_for_s=bytes_for_s))
             setsize -= 1
         return self.r_ref_insert(set(ret), i)
 
@@ -524,7 +545,12 @@ class VersionIndependentUnmarshaller:
         return self.r_ref_insert(final_frozendict, i)
 
     def t_dict(self, save_ref, bytes_for_s: bool = False) -> dict:
-        ret = self.r_ref({}, save_ref)
+        # Reserve the reference slot before reading any entries: an entry
+        # value (or key) can refer back to this dictionary, producing a
+        # recursive structure. Dicts are mutable, so installing the real
+        # dict up front means back references see the finished object even
+        # while entries are still being read.
+        ret, i = self.r_ref_reserve({}, save_ref)
         # dictionary
         while True:
             key = self.r_object(bytes_for_s=bytes_for_s)
@@ -532,7 +558,7 @@ class VersionIndependentUnmarshaller:
                 break
             val = self.r_object(bytes_for_s=bytes_for_s)
             ret[key] = val
-        return ret
+        return self.r_ref_insert(ret, i)
 
     def t_python2_string_reference(self, save_ref, bytes_for_s: bool = False):
         refnum = self.read_uint32()
@@ -835,8 +861,19 @@ class VersionIndependentUnmarshaller:
     # Since Python 3.4
     def t_object_reference(self, save_ref=None, bytes_for_s: bool = False):
         refnum = self.read_uint32()
-        if not (0 < refnum < len(self.intern_objects)):
-            return self.intern_objects[-1]
+        # Reference numbers are zero-based, matching marshal.c's RREF():
+        # the first FLAG_REF object occupies slot 0, and the high bit on
+        # the tag only decides whether a slot is reserved -- it does not
+        # shift the numbering.  An out-of-range reference means the stream
+        # is corrupt or truncated; signal that instead of returning some
+        # unrelated object, which would splice a false edge into the
+        # reference graph.
+        if not (0 <= refnum < len(self.intern_objects)):
+            raise ValueError(
+                "bad marshal data: object reference %d out of range "
+                "(have %d reference objects)"
+                % (refnum, len(self.intern_objects))
+            )
         return self.intern_objects[refnum]
 
     def t_unknown(self, save_ref=None, bytes_for_s: bool = False):

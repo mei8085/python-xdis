@@ -1,3 +1,31 @@
+Unreleased
+==========
+
+Fix object reference graph inconsistencies in the version-independent
+unmarshaller when loading executable pyc files written by another Python
+version (marshal format versions 3-5).  Shared objects are no longer
+copied, reference slots no longer keep placeholder objects, and recursive
+and mutually recursive structures keep their cycles:
+
+* TYPE_REF numbers are zero-based, as in CPython's marshal.c.  Slot 0 is
+  now resolved correctly instead of being treated as out of range, and an
+  actually out-of-range reference raises ValueError rather than silently
+  returning the last interned object.
+* Tuples (both TYPE_SMALL_TUPLE and TYPE_TUPLE) reserve their reference
+  slot before their elements are read, so a back reference fired while the
+  tuple is still being constructed resolves to the tuple itself.  A new
+  xdis/tuplebuild module builds these immutable tuples with stable
+  identity: CPython fills tuple slots in place through ctypes, while other
+  interpreters use a list-to-tuple fallback.
+* Sets, dicts, frozensets and frozendicts reserve their slot up front and
+  r_ref_insert now installs every object type into its reserved slot.
+  Previously sets were deliberately skipped, leaving an empty placeholder
+  in the reference table that redirected later back references at the
+  wrong object, and recursive dicts resolved to a key instead of themselves.
+* Add regression tests covering shared constants, nested code objects,
+  shared and recursive tuples/lists/dicts/sets/frozensets, mutual cycles,
+  and invalid references across Python 3.4-3.12 magic numbers.
+
 6.3.1 2026-09-11
 ================
 
