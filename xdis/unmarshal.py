@@ -28,6 +28,7 @@ object.
 
 import io
 import sys
+from struct import error as StructError
 from struct import unpack
 from types import EllipsisType
 from typing import Any
@@ -47,6 +48,19 @@ def long(n: int) -> LongTypeForPython3:
     # FIXME: we should write a bytes() class with a repr
     # that prints the b'' prefix so that Python2 can
     # print out Python3 code correctly
+
+
+class UnmarshalError(ValueError):
+    """
+    Raised when marshal/bytecode data is malformed: truncated,
+    structurally invalid (bad type codes or object references), or
+    beyond safety limits such as the maximum nesting depth.
+
+    This is a subclass of ``ValueError`` so that existing callers
+    which catch ``ValueError`` for bad bytecode continue to work.
+    """
+
+    pass
 
 
 # Bit set on marshalType if we should
@@ -155,7 +169,9 @@ def compat_u2s(u) -> str:
 
 
 class VersionIndependentUnmarshaller:
-    def __init__(self, fp, magic_int, bytes_for_s, code_objects={}) -> None:
+    def __init__(
+        self, fp, magic_int, bytes_for_s, code_objects=None, max_depth=None
+    ) -> None:
         """
         Marshal versions:
             0/Historical: Until 2.4/magic int 62041
@@ -166,10 +182,17 @@ class VersionIndependentUnmarshaller:
             5: [3.14, current) (self.magic_int: circa 3608)
 
         In Python 3, a ``bytes`` type is used for strings.
+
+        ``max_depth`` is the maximum nesting depth of container/code
+        objects tolerated before raising ``UnmarshalError``. When
+        ``None``, a fraction of the interpreter's recursion limit is
+        used.
         """
         self.fp = fp
         self.magic_int = magic_int
-        self.code_objects = code_objects
+        self.code_objects = {} if code_objects is None else code_objects
+
+        self._init_safety(fp, max_depth)
 
         # Save a list of offsets in the bytecode file where code
         # objects starts.
@@ -203,23 +226,68 @@ class VersionIndependentUnmarshaller:
 
         self.UNMARSHAL_DISPATCH_TABLE = UNMARSHAL_DISPATCH_TABLE
 
+    def _init_safety(self, fp, max_depth=None) -> None:
+        """
+        Set up resource-exhaustion guards used when reading untrusted
+        marshal data: a nesting-depth counter and, when the file
+        object is seekable, the end-of-file position so reads can be
+        bounded before they are attempted.
+        """
+        self._depth = 0
+        if max_depth is None:
+            # Each nesting level uses a few Python stack frames, so
+            # stay well below the interpreter recursion limit.
+            max_depth = max(100, sys.getrecursionlimit() // 4)
+        self.max_depth = max_depth
+        try:
+            here = fp.tell()
+            self._file_end = fp.seek(0, 2)
+            fp.seek(here)
+        except (AttributeError, OSError):
+            # Non-seekable stream; we can't pre-check lengths, but
+            # short reads are still caught after the fact.
+            self._file_end = None
+
+    def _check_available(self, n: int, what: str) -> None:
+        """
+        Raise UnmarshalError if reading ``n`` bytes for ``what`` is
+        nonsensical or known to run past the end of the data. This
+        prevents absurd length fields in malformed bytecode from
+        triggering huge allocations or reads.
+        """
+        if n < 0:
+            raise UnmarshalError(f"negative size {n} for {what} in marshal data")
+        if self._file_end is not None:
+            remaining = self._file_end - self.fp.tell()
+            if n > remaining:
+                raise UnmarshalError(
+                    f"truncated marshal data: {what} of {n} bytes requested "
+                    f"with only {remaining} bytes remaining"
+                )
+
     def read_float(self) -> float:
-        return unpack("<d", self.fp.read(8))[0]
+        return unpack("<d", self.read_slice(8))[0]
 
     def read_int16(self) -> int:
-        return unpack("<h", self.fp.read(2))[0]
+        return unpack("<h", self.read_slice(2))[0]
 
     def read_int32(self) -> int:
-        return unpack("<i", self.fp.read(4))[0]
+        return unpack("<i", self.read_slice(4))[0]
 
     def read_int64(self) -> int:
-        return unpack("<q", self.fp.read(8))[0]
+        return unpack("<q", self.read_slice(8))[0]
 
     def read_slice(self, n: int) -> bytes:
-        return self.fp.read(n)
+        self._check_available(n, "byte string")
+        data = self.fp.read(n)
+        if len(data) != n:
+            raise UnmarshalError(
+                f"truncated marshal data: expected {n} bytes, got {len(data)}"
+            )
+        return data
 
     def read_uint32(self) -> int:
-        return unpack("<I", self.fp.read(4))[0]
+        return unpack("<I", self.read_slice(4))[0]
 
     def load(self):
         """
@@ -237,7 +305,17 @@ class VersionIndependentUnmarshaller:
         if self.marshal_version < 3:
             assert self.intern_objects == []
 
-        return self.r_object()
+        try:
+            return self.r_object()
+        except UnmarshalError:
+            raise
+        except RecursionError:
+            # Safety net for nesting paths that don't go through
+            # r_object()'s depth guard.
+            raise UnmarshalError(
+                "excessively nested marshal data "
+                f"(maximum depth {self.max_depth})"
+            ) from None
 
     # Python 3.4+ support for reference objects.
     # The names follow marshal.c
@@ -272,38 +350,45 @@ class VersionIndependentUnmarshaller:
         defined above clearing the high-order bit, FLAG_REF.
         FLAG_REF indicates whether to save the resulting object in
         our internal object cache.
+
+        Malformed data — truncation, unknown type codes, or nesting
+        beyond ``self.max_depth`` — raises UnmarshalError; this
+        routine never silently returns a placeholder for bad input.
         """
-        byte1 = ord(self.fp.read(1))
-
-        # FLAG_REF indicates whether we "intern" or
-        # save a reference to the object.
-        # byte1 without that reference is the
-        # marshal type code, an ASCII character.
-        save_ref = False
-        if byte1 & FLAG_REF:
-            # Since 3.4, "flag" is the marshal.c name
-            save_ref = True
-            byte1 = byte1 & (FLAG_REF - 1)
-        marshal_type = chr(byte1)
-
-        # print(marshal_type)  # debug
-
-        if marshal_type in self.UNMARSHAL_DISPATCH_TABLE:
-            func_suffix = self.UNMARSHAL_DISPATCH_TABLE[marshal_type]
-            unmarshal_func = getattr(self, "t_" + func_suffix)
-            return unmarshal_func(save_ref, bytes_for_s)
-        else:
-            try:
-                sys.stderr.write(
-                    "Unknown type %i (hex %x) %c\n"
-                    % (ord(marshal_type), ord(marshal_type), marshal_type)
-                )
-            except TypeError:
-                sys.stderr.write(
-                    "Unknown type %i %c\n" % (ord(marshal_type), marshal_type)
+        self._depth += 1
+        try:
+            if self._depth > self.max_depth:
+                raise UnmarshalError(
+                    "marshal data exceeds maximum nesting depth "
+                    f"of {self.max_depth}"
                 )
 
-        return
+            byte1 = self.read_slice(1)[0]
+
+            # FLAG_REF indicates whether we "intern" or
+            # save a reference to the object.
+            # byte1 without that reference is the
+            # marshal type code, an ASCII character.
+            save_ref = False
+            if byte1 & FLAG_REF:
+                # Since 3.4, "flag" is the marshal.c name
+                save_ref = True
+                byte1 = byte1 & (FLAG_REF - 1)
+            marshal_type = chr(byte1)
+
+            # print(marshal_type)  # debug
+
+            if marshal_type in self.UNMARSHAL_DISPATCH_TABLE:
+                func_suffix = self.UNMARSHAL_DISPATCH_TABLE[marshal_type]
+                unmarshal_func = getattr(self, "t_" + func_suffix)
+                return unmarshal_func(save_ref, bytes_for_s)
+
+            raise UnmarshalError(
+                "unknown marshal type %d (hex %02x) %r at offset %d"
+                % (byte1, byte1, marshal_type, self.fp.tell() - 1)
+            )
+        finally:
+            self._depth -= 1
 
     # In C this NULL. Not sure what it should
     # translate here. Note NULL != None which is below
@@ -335,6 +420,10 @@ class VersionIndependentUnmarshaller:
         if n == 0:
             return long(0)
         size = abs(n)
+        # Each digit takes two bytes; make sure that much data is
+        # actually there before looping, so a bogus digit count can't
+        # send us into a billion-iteration loop.
+        self._check_available(size * 2, "long integer digits")
         d = long(0)
         for j in range(size):
             md = self.read_int16()
@@ -356,8 +445,8 @@ class VersionIndependentUnmarshaller:
 
     # float - Seems not in use after Python 2.4
     def t_float(self, save_ref, bytes_for_s: bool = False) -> float:
-        strsize = unpack("B", self.fp.read(1))[0]
-        s = self.fp.read(strsize)
+        strsize = self.read_slice(1)[0]
+        s = self.read_slice(strsize)
         return self.r_ref(float(s), save_ref)
 
     def t_binary_float(self, save_ref, bytes_for_s: bool = False) -> float:
@@ -365,10 +454,10 @@ class VersionIndependentUnmarshaller:
 
     def t_complex(self, save_ref, bytes_for_s: bool = False) -> complex:
         def unpack_pre_24() -> float:
-            return float(self.fp.read(unpack("B", self.fp.read(1))[0]))
+            return float(self.read_slice(self.read_slice(1)[0]))
 
         def unpack_newer() -> float:
-            return float(self.fp.read(self.read_int32()))
+            return float(self.read_slice(self.read_int32()))
 
         get_float = unpack_pre_24 if self.magic_int <= 62061 else unpack_newer
 
@@ -390,7 +479,7 @@ class VersionIndependentUnmarshaller:
         ``bytes_for_s`` is True when a Python 3 interpreter is reading Python 2 bytecode.
         """
         strsize = self.read_uint32()
-        s = self.fp.read(strsize)
+        s = self.read_slice(strsize)
         if not bytes_for_s:
             s = compat_str(s)
         return self.r_ref(s, save_ref)
@@ -404,7 +493,7 @@ class VersionIndependentUnmarshaller:
         """
         # FIXME: check
         strsize = self.read_uint32()
-        interned = compat_str(self.fp.read(strsize))
+        interned = compat_str(self.read_slice(strsize))
         self.intern_strings.append(interned)
         return self.r_ref(interned, save_ref)
 
@@ -415,26 +504,26 @@ class VersionIndependentUnmarshaller:
         bytes.
         """
         strsize = self.read_uint32()
-        s = self.fp.read(strsize)
+        s = self.read_slice(strsize)
         s = compat_str(s)
         return self.r_ref(s, save_ref)
 
     # Since Python 3.4
     def t_short_ASCII(self, save_ref, bytes_for_s: bool = False):
-        strsize = unpack("B", self.fp.read(1))[0]
-        return self.r_ref(compat_str(self.fp.read(strsize)), save_ref)
+        strsize = self.read_slice(1)[0]
+        return self.r_ref(compat_str(self.read_slice(strsize)), save_ref)
 
     # Since Python 3.4
     def t_short_ASCII_interned(self, save_ref, bytes_for_s: bool = False):
         # FIXME: check
-        strsize = unpack("B", self.fp.read(1))[0]
-        interned = compat_str(self.fp.read(strsize))
+        strsize = self.read_slice(1)[0]
+        interned = compat_str(self.read_slice(strsize))
         self.intern_strings.append(interned)
         return self.r_ref(interned, save_ref)
 
     def t_interned(self, save_ref, bytes_for_s: bool = False):
         strsize = self.read_uint32()
-        raw = self.fp.read(strsize)
+        raw = self.read_slice(strsize)
         interned = compat_str(raw)
         if self.version_triple < (3, 0):
             # A string first read as text can later be referenced as bytecode.
@@ -447,7 +536,7 @@ class VersionIndependentUnmarshaller:
 
     def t_unicode(self, save_ref, bytes_for_s: bool = False):
         strsize = self.read_uint32()
-        unicodestring = self.fp.read(strsize)
+        unicodestring = self.read_slice(strsize)
         if self.version_triple < (3, 0):
             string = UnicodeForPython3(unicodestring)
         else:
@@ -463,7 +552,7 @@ class VersionIndependentUnmarshaller:
     # Since Python 3.4
     def t_small_tuple(self, save_ref, bytes_for_s: bool = False):
         # small tuple - since Python 3.4
-        tuplesize = unpack("B", self.fp.read(1))[0]
+        tuplesize = self.read_slice(1)[0]
         ret, i = self.r_ref_reserve((), save_ref)
         while tuplesize > 0:
             ret += (self.r_object(bytes_for_s=bytes_for_s),)
@@ -537,7 +626,18 @@ class VersionIndependentUnmarshaller:
     def t_python2_string_reference(self, save_ref, bytes_for_s: bool = False):
         refnum = self.read_uint32()
         if bytes_for_s and self.version_triple < (3, 0):
-            return self.intern_string_bytes[refnum]
+            try:
+                return self.intern_string_bytes[refnum]
+            except KeyError:
+                raise UnmarshalError(
+                    f"string reference {refnum} does not refer to a "
+                    "previously interned byte string"
+                ) from None
+        if not 0 <= refnum < len(self.intern_strings):
+            raise UnmarshalError(
+                f"string reference {refnum} out of range; only "
+                f"{len(self.intern_strings)} strings interned so far"
+            )
         return self.intern_strings[refnum]
 
     def _reference_objects(self):
@@ -550,9 +650,6 @@ class VersionIndependentUnmarshaller:
     def t_slice(self, save_ref, bytes_for_s: bool = False):
         """TYPE_SLICE introducted in Marshal version 5"""
         retval, idx = self.r_ref_reserve(slice(None, None, None), save_ref)
-
-        if idx and idx < 0:
-            return
 
         # FIXME: we currently can't disambiguate between NULL and None.
         #        marshal.c exits early if start, stop, or step are NULL.
@@ -835,12 +932,15 @@ class VersionIndependentUnmarshaller:
     # Since Python 3.4
     def t_object_reference(self, save_ref=None, bytes_for_s: bool = False):
         refnum = self.read_uint32()
-        if not (0 < refnum < len(self.intern_objects)):
-            return self.intern_objects[-1]
+        if not 0 <= refnum < len(self.intern_objects):
+            raise UnmarshalError(
+                f"object reference {refnum} out of range; only "
+                f"{len(self.intern_objects)} objects interned so far"
+            )
         return self.intern_objects[refnum]
 
     def t_unknown(self, save_ref=None, bytes_for_s: bool = False):
-        raise KeyError("?")
+        raise UnmarshalError("unknown marshal type '?' in bytecode data")
 
 
 # _________________________________________________________________
@@ -848,12 +948,26 @@ class VersionIndependentUnmarshaller:
 # user interface
 
 
-def load_code(fp, magic_int, bytes_for_s: bool = False, code_objects=None):
+def _load_with_unmarshaller(fp, magic_int, bytes_for_s: bool, code_objects):
+    """
+    Create the version-appropriate unmarshaller for ``fp``.
+
+    All malformed-data failures — from any of the CPython, Graal, or
+    RustPython unmarshallers — are reported as UnmarshalError, so
+    callers see one consistent, identifiable error type no matter
+    which loading entry point or bytecode flavor is involved.
+    """
     if code_objects is None:
         code_objects = {}
     if isinstance(fp, bytes):
         fp = io.BytesIO(fp)
 
+    try:
+        # Boundary check on the magic/version before any data is read.
+        magic_int2tuple(magic_int)
+    except KeyError:
+        raise UnmarshalError(f"unknown magic number {magic_int}") from None
+
     if magic_int in GRAAL3_MAGICS:
         from xdis.unmarsh_graal import VersionIndependentUnmarshallerGraal
 
@@ -870,28 +984,26 @@ def load_code(fp, magic_int, bytes_for_s: bool = False, code_objects=None):
         um_gen = VersionIndependentUnmarshaller(
             fp, magic_int, bytes_for_s, code_objects=code_objects
         )
-    return um_gen.load()
+    return um_gen
+
+
+def load_code(fp, magic_int, bytes_for_s: bool = False, code_objects=None):
+    um_gen = _load_with_unmarshaller(fp, magic_int, bytes_for_s, code_objects)
+    try:
+        return um_gen.load()
+    except UnmarshalError:
+        raise
+    except (EOFError, StructError, RecursionError, TypeError) as exc:
+        raise UnmarshalError(f"malformed marshal data: {exc}") from exc
 
 
 def load_code_and_get_file_offsets(
     fp, magic_int, bytes_for_s: bool = False, code_objects=None
 ) -> tuple:
-    if isinstance(fp, bytes):
-        fp = io.BytesIO(fp)
-    if magic_int in GRAAL3_MAGICS:
-        from xdis.unmarsh_graal import VersionIndependentUnmarshallerGraal
-
-        um_gen = VersionIndependentUnmarshallerGraal(
-            fp, magic_int, bytes_for_s, code_objects
-        )
-    elif magic_int in RUSTPYTHON_MAGICS:
-        from xdis.unmarsh_rust import VersionIndependentUnmarshallerRust
-
-        um_gen = VersionIndependentUnmarshallerRust(
-            fp, magic_int, bytes_for_s, code_objects
-        )
-    else:
-        um_gen = VersionIndependentUnmarshaller(
-            fp, magic_int, bytes_for_s, code_objects=code_objects
-        )
-    return um_gen.load(), um_gen.code_to_file_offsets
+    um_gen = _load_with_unmarshaller(fp, magic_int, bytes_for_s, code_objects)
+    try:
+        return um_gen.load(), um_gen.code_to_file_offsets
+    except UnmarshalError:
+        raise
+    except (EOFError, StructError, RecursionError, TypeError) as exc:
+        raise UnmarshalError(f"malformed marshal data: {exc}") from exc

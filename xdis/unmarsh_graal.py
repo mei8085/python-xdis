@@ -130,7 +130,7 @@ JAVA_MARSHAL_BASE = 1 << JAVA_MARSHAL_SHIFT
 
 
 class VersionIndependentUnmarshallerGraal(VersionIndependentUnmarshaller):
-    def __init__(self, fp, magic_int, bytes_for_s, code_objects={}) -> None:
+    def __init__(self, fp, magic_int, bytes_for_s, code_objects=None) -> None:
         """
         Marshal versions:
             2: [2.5, 3.4a0) (self.magic_int: 62071 until 3250)
@@ -142,7 +142,9 @@ class VersionIndependentUnmarshallerGraal(VersionIndependentUnmarshaller):
         """
         self.fp = fp
         self.magic_int = magic_int
-        self.code_objects = code_objects
+        self.code_objects = {} if code_objects is None else code_objects
+
+        self._init_safety(fp)
 
         # Save a list of offsets in the bytecode file where code
         # objects starts.

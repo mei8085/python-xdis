@@ -14,8 +14,8 @@ class TestLoad(unittest.TestCase):
         obj_path = check_object_path(__file__)
         if os.path.exists(obj_path):
             (version, timestamp, magic_int, co2, is_pypy,
-             source_size, sip_hash) = load_module(obj_path)
-            self.assertEqual(sys.version[0:3], str(version))
+             source_size, sip_hash, file_offsets) = load_module(obj_path)
+            self.assertEqual(tuple(sys.version_info[0:2]), tuple(version[:2]))
             if IS_PYPY:
                 self.assertTrue("Skipped until we get better code comparison on PYPY")
             else:

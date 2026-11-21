@@ -89,6 +89,7 @@ from xdis.magics import (
     magic2int,
     sysinfo2magic,
 )
+from xdis.unmarshal import UnmarshalError
 from xdis.op_imports import get_opcode_module
 from xdis.opcodes import (
     opcode_13,
@@ -269,5 +270,6 @@ __all__ = [
     "show_code",
     "show_module_header",
     "sysinfo2magic",
+    "UnmarshalError",
     "write_bytecode_file",
 ]

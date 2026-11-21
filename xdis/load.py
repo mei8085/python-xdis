@@ -182,6 +182,11 @@ def load_module(
         sip_hash   : the SIP Hash for the file (only in Python 3.7 or greater), if the file
                      was created with a SIP hash or None otherwise. Note that if the sip_hash is not
                      none, then the timestamp and source_size will be invalid.
+
+    Malformed input — a bad magic number, an unsupported version, a
+    truncated file, or corrupt marshal data — always raises
+    ``ImportError`` from this entry point, and the caller's
+    ``code_objects`` dictionary is left untouched by the failed load.
     """
 
     # Some sanity checks
@@ -191,7 +196,7 @@ def load_module(
         raise ImportError(f"File name: '{filename}' isn't a file")
     elif osp.getsize(filename) < 50:
         raise ImportError(
-            "File name: '%s (%d bytes)' is too short to be a valid pyc file"
+            "File name: '%s' (%d bytes) is too short to be a valid pyc file"
             % (filename, osp.getsize(filename))
         )
 
@@ -224,8 +229,23 @@ def load_module_from_file_object(
 
     timestamp = 0
     file_offsets = {}
+
+    # Remember which code objects were known before this load, so that
+    # on failure the caller's dictionary is not left polluted with
+    # partially-loaded results that could be mistaken for valid code.
+    prior_code_object_keys = set(code_objects.keys())
+
+    def rollback_code_objects() -> None:
+        for key in set(code_objects.keys()) - prior_code_object_keys:
+            code_objects.pop(key, None)
+
     try:
         magic = fp.read(4)
+        if len(magic) < 4:
+            raise ImportError(
+                f"File {filename} is too short ({len(magic)} bytes) "
+                "to be a valid pyc file"
+            )
         magic_int = magic2int(magic)
 
         if magic_int == 3531:
@@ -237,8 +257,11 @@ def load_module_from_file_object(
             if code_type == b'c':
                 # Is RustPython 3.13 using CPython's 3.12 magic number.
                 magic_int = 35310
-            else:
-                assert code_type == b'\xe3', "Expecting magic int 3531 to have a code type b'0x63 or b'0x33' at offset 0x10"
+            elif code_type != b'\xe3':
+                raise ImportError(
+                    "Expecting magic int 3531 to have a code type b'0x63' "
+                    f"or b'0x33' at offset 0x10 in {filename}"
+                )
             fp.seek(0x04)
 
         # For reasons I don't understand, PyPy 3.2 stores a magic
@@ -333,7 +356,7 @@ def load_module_from_file_object(
                     is_graal = False
                 if save_file_offsets and not is_graal:
                     co, file_offsets = xdis.unmarshal.load_code_and_get_file_offsets(
-                        fp, magic_int, code_objects
+                        fp, magic_int, code_objects=code_objects
                     )
 
                 elif my_magic_int == magic_int and not is_graal:
@@ -346,19 +369,45 @@ def load_module_from_file_object(
                 elif fast_load:
                     co = xdis.marsh.load(fp, magicint2version[magic_int])
                 else:
-                    co = xdis.unmarshal.load_code(fp, magic_int, code_objects)
+                    co = xdis.unmarshal.load_code(
+                        fp, magic_int, code_objects=code_objects
+                    )
+
+                if co is None:
+                    # A payload that unmarshals to NULL/None is not a
+                    # usable code object; don't hand it back as though
+                    # the load succeeded.
+                    raise ImportError(
+                        f"Ill-formed bytecode file {filename}: "
+                        "top-level object is not code"
+                    )
                 pass
             else:
                 co = None
         except NotImplementedError:
+            rollback_code_objects()
+            raise
+        except ImportError:
+            rollback_code_objects()
             raise
         except Exception:
             kind, msg = sys.exc_info()[0:2]
-            import traceback
-
-            traceback.print_exc()
-            raise ImportError(f"Ill-formed bytecode file {filename}\n{kind}; {msg}")
-
+            rollback_code_objects()
+            raise ImportError(
+                f"Ill-formed bytecode file {filename}\n{kind}; {msg}"
+            ) from None
+    except ImportError:
+        raise
+    except Exception as exc:
+        # Errors outside the parsing section proper, e.g. an
+        # unsupported seek on a strange file object. Report these the
+        # same way as any other malformed-input failure so callers
+        # get a consistent error type from every entry point.
+        rollback_code_objects()
+        raise ImportError(
+            f"Unable to load bytecode file {filename}\n"
+            f"{type(exc).__name__}; {exc}"
+        ) from None
     finally:
         fp.close()
 
