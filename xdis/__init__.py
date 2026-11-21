@@ -44,13 +44,27 @@ from xdis.codetype import (
     codeType2Portable,
 )
 from xdis.codetype.base import code_has_star_arg, code_has_star_star_arg, iscode
+from xdis.control_flow import (
+    EntryKind,
+    FlowError,
+    FlowGraph,
+    FlowInstruction,
+    Layout,
+    TargetClass,
+    build_flow_graph,
+    bytecode_layout,
+    classify_offset,
+)
 from xdis.cross_dis import (
     code_info,
     extended_arg_val,
     findlabels,
     findlinestarts,
     format_code_info,
+    falls_through,
+    get_cache_entries,
     get_code_object,
+    get_jump_target,
     get_jump_target_maps,
     instruction_size,
     op_size,
@@ -210,6 +224,17 @@ __all__ = [
     "codeType2Portable",
     "code_has_star_arg",
     "code_has_star_star_arg",
+    # control_flow
+    "EntryKind",
+    "FlowError",
+    "FlowGraph",
+    "FlowInstruction",
+    "Layout",
+    "TargetClass",
+    "build_flow_graph",
+    "bytecode_layout",
+    "classify_offset",
+    "falls_through",
     # cross_dis
     "code_info",
     "disassemble_file",
@@ -219,8 +244,10 @@ __all__ = [
     "findlabels",
     "findlinestarts",
     "format_code_info",
+    "get_cache_entries",
     "get_code_object",
     "get_instructions_bytes",
+    "get_jump_target",
     "get_jump_target_maps",
     # disasm
     "get_opcode",

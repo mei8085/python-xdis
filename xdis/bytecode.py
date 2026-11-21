@@ -32,6 +32,7 @@ from typing import Iterable, Iterator, Optional, Tuple
 from xdis.cross_dis import (
     format_code_info,
     get_code_object,
+    get_jump_target,
     instruction_size,
     op_has_argument,
 )
@@ -351,28 +352,12 @@ def get_logical_instruction_at_offset(
                 else:
                     argval, argrepr = get_name_info(arg, names)
             elif op in opc.JREL_OPS:
-                signed_arg = arg
-                if "JUMP_BACKWARD" in opname:
-                    signed_arg = -arg
-                elif opc.version_tuple >= (3, 14) and "END_ASYNC_FOR" in opname:
-                    signed_arg = -arg
-
-                argval = i + get_jump_val(signed_arg, opc.python_version)
-
-                # check cache instructions for python 3.13
-                if opc.version_tuple >= (3, 13):
-                    if opc.opname[op] in [
-                        "POP_JUMP_IF_TRUE",
-                        "POP_JUMP_IF_FALSE",
-                        "POP_JUMP_IF_NONE",
-                        "POP_JUMP_IF_NOT_NONE",
-                        "JUMP_BACKWARD",
-                    ]:
-                        argval += 2
-
-                # FOR_ITER has a cache instruction in 3.12
-                if opc.version_tuple >= (3, 12) and opname == "FOR_ITER":
-                    argval += 2
+                # Compute the target with the version's operand unit and
+                # skip the jump's own inline CACHE words (3.11+), so the
+                # result matches the interpreter and ``dis`` rather than
+                # landing on cache data. This also handles backward
+                # jumps, including 3.14's backwards ``END_ASYNC_FOR``.
+                argval = get_jump_target(offset, op, arg, opc)
                 argrepr = "to " + repr(argval)
                 if opc.version_tuple >= (3, 14) and "END_ASYNC_FOR" in opname:
                     argrepr = "from " + repr(argval)

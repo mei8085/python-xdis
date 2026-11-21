@@ -16,10 +16,29 @@
 
 """Python disassembly functions specific to wordcode from Python 3.6+"""
 from xdis.bytecode import op_has_argument
-from xdis.cross_dis import get_cache_size_313, unpack_opargs_bytecode_310
+from xdis.cross_dis import (
+    falls_through,
+    get_cache_entries,
+    get_jump_target,
+    instruction_size,
+    unpack_opargs_bytecode_310,
+)
 
 
 def unpack_opargs_wordcode(code, opc):
+    """Yield ``(offset, opcode, arg)`` for fixed 2-byte wordcode.
+
+    Inline ``CACHE`` words (3.11+) are skipped and operands are folded
+    with the version's ``EXTENDED_ARG`` shift, exactly as CPython's
+    ``dis._unpack_opargs`` does — otherwise the physical layout and the
+    jump arithmetic derived from it drift apart for 3.11+ bytecode.
+    """
+    if isinstance(code, (bytes, bytearray, memoryview)):
+        yield from unpack_opargs_bytecode_310(code, opc)
+        return
+
+    # The remaining path handles bytecode supplied as a string (for
+    # example Python 3.x bytecode inspected from a 2.x interpreter).
     extended_arg = 0
     try:
         n = len(code)
@@ -27,25 +46,20 @@ def unpack_opargs_wordcode(code, opc):
         code = code.co_code
         n = len(code)
 
-    if isinstance(code[0], str):
-        # This happens handling Python 3.x on a 2.x interpreter
-        for i in range(0, n, 2):
-            op = ord(code[i])
-            if op_has_argument(op, opc):
-                arg = ord(code[i + 1]) | extended_arg
-                extended_arg = (arg << 8) if op == opc.EXTENDED_ARG else 0
-            else:
-                arg = None
-            yield i, op, arg
-    else:
-        for i in range(0, n, 2):
-            op = code[i]
-            if op_has_argument(op, opc):
-                arg = code[i + 1] | extended_arg
-                extended_arg = (arg << 8) if op == opc.EXTENDED_ARG else 0
-            else:
-                arg = None
-            yield i, op, arg
+    caches = 0
+    for i in range(0, n - 1, 2):
+        if caches:
+            caches -= 1
+            continue
+        op = ord(code[i])
+        caches = get_cache_entries(opc, opc.opname[op])
+        if op_has_argument(op, opc):
+            arg = ord(code[i + 1]) | extended_arg
+            extended_arg = (arg << 8) if op == opc.EXTENDED_ARG else 0
+        else:
+            arg = None
+            extended_arg = 0
+        yield i, op, arg
 
 
 def findlabels(code, opc):
@@ -60,23 +74,13 @@ def findlabels(code, opc):
 
     offsets = []
     for offset, op, arg in unpack_opargs(code, opc):
-        if arg is not None:
-            arg2 = arg * 2 if opc.version_tuple >= (3, 10) else arg
-            if op in opc.JREL_OPS:
-                if opc.version_tuple >= (3, 11) and opc.opname[op] in (
-                    "JUMP_BACKWARD",
-                    "JUMP_BACKWARD_NO_INTERRUPT",
-                ):
-                    arg = -arg
-                jump_offset = offset + 2 + arg2
-                if opc.version_tuple >= (3, 13):
-                    jump_offset += 2 * get_cache_size_313(opc.opname[op])
-            elif op in opc.JABS_OPS:
-                jump_offset = arg2
-            else:
-                continue
-            if jump_offset not in offsets:
-                offsets.append(jump_offset)
+        if arg is None:
+            continue
+        jump_offset = get_jump_target(offset, op, arg, opc)
+        if jump_offset is None:
+            continue
+        if jump_offset not in offsets:
+            offsets.append(jump_offset)
     return offsets
 
 
@@ -87,25 +91,50 @@ def get_jump_target_maps(code, opc) -> dict:
     instructions. Therefore, the keys of the dictionary are reachable
     instructions. The values of the dictionary may be useful in control-flow
     analysis.
+
+    This mirrors :func:`xdis.cross_dis.get_jump_target_maps` for 3.6+
+    wordcode but is retained as the ``opc.get_jump_target_maps`` entry
+    point that opcode modules have historically exposed. Fallthrough
+    edges are only recorded between physically adjacent instructions, so
+    inline ``CACHE`` words (3.11+) and jump targets computed in the
+    wrong unit do not invent or drop edges. An ``EXTENDED_ARG`` chain is
+    one logical instruction located at its first word.
     """
+    unpack_opargs = (
+        unpack_opargs_wordcode
+        if opc.version_tuple < (3, 10)
+        else unpack_opargs_bytecode_310
+    )
+    extended_arg_op = getattr(opc, "EXTENDED_ARG", None)
+
     offset2prev = {}
-    prev_offset = -1
-    for offset, op, arg in unpack_opargs_wordcode(code, opc):
-        if prev_offset >= 0:
-            prev_list = offset2prev.get(offset, [])
-            prev_list.append(prev_offset)
-            offset2prev[offset] = prev_list
-        prev_offset = offset
-        if op in opc.NOFOLLOW:
-            prev_offset = -1
+    prev_node = -1
+    prev_end = -1
+    chain_head = -1
+    for offset, op, arg in unpack_opargs(code, opc):
+        if op == extended_arg_op:
+            if chain_head < 0:
+                chain_head = offset
+            continue
+        node = chain_head if chain_head >= 0 else offset
+        chain_head = -1
+        if prev_node >= 0 and prev_end == node:
+            prev_list = offset2prev.get(node, [])
+            prev_list.append(prev_node)
+            offset2prev[node] = prev_list
+        if falls_through(op, opc):
+            prev_node = node
+        else:
+            prev_node = -1
+        prev_end = (
+            offset
+            + instruction_size(op, opc)
+            + 2 * get_cache_entries(opc, opc.opname[op])
+        )
         if arg is not None:
-            jump_offset = -1
-            if op in opc.JREL_OPS:
-                jump_offset = offset + 2 + arg
-            elif op in opc.JABS_OPS:
-                jump_offset = arg
-            if jump_offset >= 0:
+            jump_offset = get_jump_target(offset, op, arg, opc)
+            if jump_offset is not None:
                 prev_list = offset2prev.get(jump_offset, [])
-                prev_list.append(offset)
+                prev_list.append(node)
                 offset2prev[jump_offset] = prev_list
     return offset2prev

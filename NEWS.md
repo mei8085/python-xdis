@@ -1,3 +1,39 @@
+6.3.2 (in progress)
+===================
+
+* Control-flow graphs now agree with the interpreter across bytecode
+  versions. Jump targets and predecessor edges follow each version's
+  instruction width and extended-argument semantics: variable 1/3-byte
+  instructions before 3.6, fixed 2-byte words after; jump operands counted
+  in bytes before 3.10 and in 2-byte words after; `EXTENDED_ARG` shifting
+  16 bits before 3.6 and 8 bits after; inline `CACHE` words (3.11+) never
+  treated as instructions or jump entries; backward direction encoded in
+  the opcode name (3.11+) and 3.14's backwards `END_ASYNC_FOR`.
+* A shared `xdis.cross_dis.get_jump_target` resolves a jump to its byte
+  offset, skipping the jump's own inline caches. `get_cache_entries`
+  reports each version's inline-cache layout (3.11-3.15), including
+  specialized opcodes, and no longer gives a cached opcode's count to an
+  unrelated opcode that merely shares a prefix (e.g. `CALL_FUNCTION_EX`).
+* `op_has_argument` uses the explicit `hasarg` table from 3.12 on instead
+  of `HAVE_ARGUMENT`, which stops being a valid threshold in 3.13.
+* New `xdis.control_flow` builds a control-flow graph with one node per
+  logical instruction and classifies every jump and exception entry as a
+  legal head, an `EXTENDED_ARG`-chain continuation, a mid-instruction
+  operand byte, a `CACHE` slot, or out of bounds. Only executable entries
+  produce nodes and edges; the rest are reported as errors, and an
+  executable entry into an `EXTENDED_ARG` chain is kept (flagged) so no
+  edge is silently lost. Exception-table handlers gain an edge from every
+  protected instruction, and returns/unconditional jumps no longer acquire
+  fallthrough edges even on versions where `nofollow` is incomplete or
+  empty.
+* `get_jump_target_maps` records an out-of-bounds target instead of
+  dropping it, and only links fallthrough edges between physically adjacent
+  instructions, so inline caches do not create or remove edges.
+* Add regression tests covering per-version widths, cache layout, jump
+  targets against `dis.findlabels`, layout/decoded-stream agreement,
+  predecessor completeness, and the data-byte / out-of-bounds / chain /
+  cache error states.
+
 6.3.1 2026-09-11
 ================
 
